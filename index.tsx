@@ -1,9 +1,15 @@
-import { addMessagePopoverButton as addButton, removeMessagePopoverButton as removeButton } from "@api/MessagePopover";
-import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 import { ApplicationCommandInputType, ApplicationCommandOptionType, sendBotMessage } from "@api/Commands";
+import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
+import { addMessagePopoverButton as addButton, removeMessagePopoverButton as removeButton } from "@api/MessagePopover";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelStore, Constants, Menu, RestAPI, UserStore } from "@webpack/common";
+import { ChannelStore, Constants, Menu, MessageStore, RestAPI, UserStore } from "@webpack/common";
 
 const settings = definePluginSettings({
     replacementText: {
@@ -25,6 +31,11 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Delete the original message from server. If disabled, the original message will reappear on client restart.",
         default: true
+    },
+    silentDeleteOnEmptyEdit: {
+        type: OptionType.BOOLEAN,
+        description: "Silently delete a message whenever you submit an edit with the content fully erased.",
+        default: false
     },
     purgeInterval: {
         type: OptionType.NUMBER,
@@ -66,12 +77,12 @@ async function silentDeleteMessage(channelId: string, messageId: string, deleteO
 
         await sleep(deleteDelay);
         await RestAPI.del({ url: Constants.Endpoints.MESSAGE(channelId, response.body.id) });
-        
+
         if (deleteOriginal && shouldDelete) {
             await sleep(100);
             await RestAPI.del({ url: Constants.Endpoints.MESSAGE(channelId, messageId) });
         }
-        
+
         return true;
     } catch (error) {
         console.error("[SilentDelete] Error:", error);
@@ -81,7 +92,7 @@ async function silentDeleteMessage(channelId: string, messageId: string, deleteO
 
 const messageContextMenuPatch: NavContextMenuPatchCallback = (children, { message }) => {
     if (!message || message.author.id !== UserStore.getCurrentUser().id || !message.deleted) return;
-    
+
     const group = findGroupChildrenByChildId("remove-message-history", children) ?? children;
     group.push(
         <Menu.MenuItem
@@ -102,11 +113,22 @@ export default definePlugin({
     ],
     dependencies: ["MessagePopoverAPI", "CommandsAPI"],
     settings,
-    
+
     contextMenus: {
         "message": messageContextMenuPatch
     },
-    
+
+    async onBeforeMessageEdit(channelId, messageId, messageObj) {
+        if (!settings.store.silentDeleteOnEmptyEdit || messageObj.content.length !== 0) return;
+
+        const msg = MessageStore.getMessage(channelId, messageId);
+        if (!msg || msg.author.id !== UserStore.getCurrentUser().id || msg.deleted) return;
+
+        if (await silentDeleteMessage(channelId, messageId)) {
+            return { cancel: true };
+        }
+    },
+
     commands: [
         {
             name: "silentpurge",
@@ -117,11 +139,9 @@ export default definePlugin({
                 description: "Number of your messages to silently delete (1-100)",
                 type: ApplicationCommandOptionType.INTEGER,
                 required: true,
-                minValue: 1,
-                maxValue: 100
             }],
             execute: (opts, ctx) => {
-                const count = opts.find(o => o.name === "count")?.value as number;
+                const count = Number(opts.find(o => o.name === "count")?.value);
                 if (!count || count < 1) return;
 
                 const channelId = ctx.channel.id;
@@ -131,23 +151,23 @@ export default definePlugin({
                     try {
                         const userMessages: any[] = [];
                         let lastMessageId: string | undefined;
-                        
+
                         while (userMessages.length < count) {
                             const response = await RestAPI.get({
                                 url: Constants.Endpoints.MESSAGES(channelId),
                                 query: { limit: 100, ...(lastMessageId && { before: lastMessageId }) }
                             });
-                            
+
                             const messages = response.body;
                             if (!messages?.length) break;
-                            
+
                             for (const msg of messages) {
                                 if (msg.author?.id === currentUserId) {
                                     userMessages.push(msg);
                                     if (userMessages.length >= count) break;
                                 }
                             }
-                            
+
                             lastMessageId = messages[messages.length - 1].id;
                             if (messages.length < 100) break;
                             await sleep(100);
@@ -171,7 +191,7 @@ export default definePlugin({
             }
         }
     ],
-    
+
     start() {
         addButton("SilentDelete", msg => {
             if (msg.author.id !== UserStore.getCurrentUser().id || msg.deleted) return null;
@@ -184,7 +204,7 @@ export default definePlugin({
                 onClick: () => silentDeleteMessage(msg.channel_id, msg.id),
                 dangerous: true
             };
-        });
+        }, SilentDeleteIcon);
     },
 
     stop() {
